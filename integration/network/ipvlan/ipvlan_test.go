@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/integration/internal/container"
 	net "github.com/docker/docker/integration/internal/network"
 	n "github.com/docker/docker/integration/network"
+	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/daemon"
 	"gotest.tools/v3/assert"
@@ -95,9 +96,6 @@ func TestDockerNetworkIpvlan(t *testing.T) {
 		}, {
 			name: "L3Addressing",
 			test: testIpvlanL3Addressing,
-		}, {
-			name: "IpvlanExperimentalV4Only",
-			test: testIpvlanExperimentalV4Only,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -444,18 +442,6 @@ func testIpvlanL3Addressing(t *testing.T, ctx context.Context, client dclient.AP
 	assert.Check(t, is.Contains(result.Combined(), "default dev eth0"))
 }
 
-// Check that '--ipv4=false' is only allowed with '--experimental'.
-// (Remember to remove `--experimental' from TestMacvlanIPAM when it's
-// no longer needed, and maybe use a single daemon for all of its tests.)
-func testIpvlanExperimentalV4Only(t *testing.T, ctx context.Context, client dclient.APIClient) {
-	_, err := net.Create(ctx, client, "testnet",
-		net.WithIPvlan("", "l3"),
-		net.WithIPv4(false),
-	)
-	defer client.NetworkRemove(ctx, "testnet")
-	assert.ErrorContains(t, err, "IPv4 can only be disabled if experimental features are enabled")
-}
-
 // Check that an ipvlan interface with '--ipv6=false' doesn't get kernel-assigned
 // IPv6 addresses, but the loopback interface does still have an IPv6 address ('::1').
 // Also check that with '--ipv4=false', there's no IPAM-assigned IPv4 address.
@@ -464,6 +450,9 @@ func TestIpvlanIPAM(t *testing.T) {
 	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
 
 	ctx := testutil.StartSpan(baseContext, t)
+	d := daemon.New(t)
+	d.StartWithBusybox(ctx, t)
+	defer d.Stop(t)
 
 	tests := []struct {
 		name       string
@@ -499,14 +488,6 @@ func TestIpvlanIPAM(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := testutil.StartSpan(ctx, t)
-
-			var daemonOpts []daemon.Option
-			if !tc.enableIPv4 {
-				daemonOpts = append(daemonOpts, daemon.WithExperimental())
-			}
-			d := daemon.New(t, daemonOpts...)
-			d.StartWithBusybox(ctx, t)
-			t.Cleanup(func() { d.Stop(t) })
 			c := d.NewClientT(t, dclient.WithVersion(tc.apiVersion))
 
 			netOpts := []func(*network.CreateOptions){
@@ -701,4 +682,34 @@ func TestPointToPoint(t *testing.T) {
 			assert.Check(t, is.Contains(res.Stdout.String(), "1 packets transmitted, 1 packets received"))
 		})
 	}
+}
+
+func TestEndpointWithCustomIfname(t *testing.T) {
+	skip.If(t, testEnv.IsRemoteDaemon)
+	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
+
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	// master dummy interface 'di' notation represent 'docker ipvlan'
+	const master = "di-dummy0"
+	n.CreateMasterDummy(ctx, t, master)
+	defer n.DeleteInterface(ctx, t, master)
+
+	// create a network specifying the desired sub-interface name
+	const netName = "ipvlan-custom-ifname"
+	net.CreateNoError(ctx, t, apiClient, netName, net.WithIPvlan("di-dummy0.70", ""))
+
+	ctrID := container.Run(ctx, t, apiClient,
+		container.WithCmd("ip", "-o", "link", "show", "foobar"),
+		container.WithEndpointSettings(netName, &network.EndpointSettings{
+			DriverOpts: map[string]string{
+				netlabel.Ifname: "foobar",
+			},
+		}))
+	defer container.Remove(ctx, t, apiClient, ctrID, containertypes.RemoveOptions{Force: true})
+
+	out, err := container.Output(ctx, apiClient, ctrID)
+	assert.NilError(t, err)
+	assert.Assert(t, strings.Contains(out.Stdout, ": foobar@if"), "expected ': foobar@if' in 'ip link show':\n%s", out.Stdout)
 }
